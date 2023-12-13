@@ -1,0 +1,459 @@
+library(dplyr)
+library(vcdExtra) #For CMHtest()
+library(stringr) #for word()
+library(DescTools) #for OddsRatio()
+library(mgcv) #for gam()
+library(forcats) #for fct_collapse() which collapses levels into new ones
+library(glmtoolbox) #for gvif()
+library(ROCit) #used for rocit()
+library(ROCR) #used to plot roc objects
+
+#############Preparing training_bin data for logistic regression###############
+#import binned training data
+training_bin<-read.csv("C:/Users/sudra/OneDrive/Desktop/Logistic Regression Files/Homework2_LR/insurance_t_bin.csv")
+
+#Make all features factors
+for (i in 1:47){
+  training_bin[[i]]=as.factor(training_bin[[i]])
+}
+
+#Investigate NA's
+#training_NA<-training_bin %>% filter(is.na(INV)==TRUE)
+#training_odd_branches<-training_bin %>%
+#filter(BRANCH %in% c("B14","B15","B19","B18"))
+#These two above tables are the same.
+
+#training_NA_HMOWN<-training_bin %>% filter(is.na(HMOWN)==TRUE)
+
+#count number of binary variables for paper
+#t=0
+#for (k in 1:47){
+#  if (length(levels(training_bin[[k]]))==2){
+#    t=t+1
+#  }
+#}
+
+#For each feature, make a category of NA's called "None" should they exist
+for (i in 1:47){
+  if ( sum(is.na(training_bin[[i]])) >0) {
+    levels(training_bin[[i]])<-c(levels(training_bin[[i]]), "None")
+    training_bin[[i]][is.na(training_bin[[i]])]<-"None"
+    print(paste(" 'None' category was added to feature:",i))
+  }
+}
+
+#Search for non-interaction separations
+for (k in 1:47){
+  table<-table(training_bin[[k]],training_bin$INS)
+  for (i in 1:nlevels(training_bin[[k]])){
+    for (j in 1:2){
+      if (k==21){ #Ignore feature 21. That's INS.
+        next
+      }
+      if (table[i,j]==0){
+        print(paste("Separation issue in feature number:",k)) 
+      }
+    }
+  }
+}
+#Separation issues in features 2 and 13 i.e. CASHBK and MMCRED. These are
+#quasi-separated.
+
+
+#Change levels in CASHBK to 0 and 1+; change levels in MMCRED to 0,1,2, and 3+
+levels(training_bin[[2]])<-c(levels(training_bin[[2]]), "1+")
+training_bin[[2]]<-fct_collapse(training_bin[[2]],"1+"=c("1","2"))
+
+
+levels(training_bin[[13]])<-c(levels(training_bin[[13]]),"3+")
+training_bin[[13]]<-fct_collapse(training_bin[[13]],"3+"=c("3","5"))
+
+#Find and get rid of multi-collinearity issues. The following were 
+#dropped:
+#"CC",
+#"INV",
+#"BRANCH",
+#"PHONE_Bin",
+#"POS_Bin",
+#"POSAMT_Bin",
+#"MMBAL_Bin",
+#"CCBAL_Bin"
+
+#drop variables due to gvif>5 and then put perfect multicollinearity
+#variables back into consideration
+
+training_bin_dropped<-training_bin %>% select(-c(
+  #Drop three below due to gvif>5
+  "DDA",
+  "SAV",
+  "MTG",
+  "CD"
+))
+################################################################################
+
+########################Determine Logistic regression model#####################
+
+#Do a stepwise (backwards) selection algorithm to find better model for dropped vs
+#dropped2; this will be done via AIC
+
+empty_model<-glm(INS~1,data=training_bin_dropped,family=binomial(link="logit"))
+full_model<-glm(INS~.,data=training_bin_dropped,family=binomial(link="logit"))
+
+#############backwards model
+#step_model<-step(full_model,
+#                scope=list(lower=empty_model,
+#                          upper=full_model),
+#              direction="backward",
+#             k=qchisq(.0002,1,lower.tail=FALSE))
+
+
+step_model_both<-step(empty_model,
+                      scope=list(lower=empty_model,
+                                 upper=full_model),
+                      direction="both",
+                      k=qchisq(.0002,1,lower.tail=FALSE))
+
+######Both direction printout
+#Step:  AIC=9218.62
+#INS ~ SAVBAL_Bin + DDABAL_Bin + CDBAL_Bin + MM + INV + DIRDEP + 
+#IRA
+
+#After running some tests, the models created are below. There are two models
+#that should be tried out!
+#
+#
+#
+# Note: AIC in step-wise is
+# equivalent to having an alpha level of (at best) .1573!
+#
+# BIC in step-wise is equivalent to having an alpha level that varies based on
+# the number of observations. alpha= 1-probability(chi^2>ln(n)) with some dof.
+#   
+# Due to the above, we didn't use AIC or BIC for selection criterion as .0002
+# is the lowest of the three criteria.
+
+######################################USING training_bin_dropped backwards
+#Step:  AIC=9201.27
+#INS ~ IRA + INV + ILS + MM + CC + DDABAL_Bin + CHECKS_Bin + TELLER_Bin + 
+#SAVBAL_Bin + ATMAMT_Bin + CDBAL_Bin
+
+
+#Subset data to backwards selected variables and create main
+#effects model
+
+training_bin_subset<-training_bin %>% select(c(
+  "INS",
+  "IRA",
+  "INV",
+  "ILS",
+  "MM",
+  "CC",
+  "DDABAL_Bin",
+  "CHECKS_Bin", 
+  "TELLER_Bin",
+  "SAVBAL_Bin",
+  "ATMAMT_Bin",
+  "CDBAL_Bin"
+))
+
+main_effects_model<-glm( INS ~ ., data=training_bin_subset,family=binomial
+                         (link="logit"))
+summary(main_effects_model)
+
+#Run a forwards model from the main effects model to see if there
+#are any significant interaction terms
+full_model_subset<-glm( INS ~ .^2, data=training_bin_subset,family=binomial
+                        (link="logit"))
+
+#Check to see if one should add interactions in the model...
+
+#step_model<-step(main_effects_model,
+#                scope=list(lower=main_effects_model,
+#                          upper=full_model_subset),
+#              direction="forward",
+#             k=qchisq(.0002,1,lower.tail=FALSE))
+#No interaction terms added!
+#It looks like no interactions were added in for either model
+
+#################Get AUC on training data#######################################
+
+#Make new column on training_bin (p_hat) that finds predicted probs from model
+training_bin$p_hat<-predict(full_model_subset,type="response")
+
+#Create ROC curve and get AUC
+roc_curve_logistic<-rocit(score=training_bin$p_hat,
+                 class=training_bin$INS)
+
+summary(roc_curve_logistic)
+#AUC is .8231
+
+plot(roc_curve_logistic)
+################################################################################
+
+###########Preparing non-binned data for machine learning models################
+library(earth) #used for earth()
+library(mgcv) #for gam()
+library(randomForest) #used for randomForest(),varImpPlot()
+library(xgboost) #used for 
+library(caret) #used for train() and trainControl()
+library(nnet) #used for nnet()
+
+#Read in training set
+ins_training<-read.csv("C:/Users/sudra/OneDrive/Desktop/Machine_Learning_Files/insurance_t.csv")
+
+#Search for features with missing values
+for (i in 1:38){
+  if ( sum(is.na(ins_training[[i]])) >0) {
+    print(paste(" Missing value was found in feature:",i,sum(is.na(ins_training[[i]]))/8495))
+  }
+}
+#Features 1,10,16,17,22,23,27,28,29,31,32,33,34,and 35 have missing values with
+#proportions less than .5. So we're in a postition to impute.
+#Of these, ACCTAGE, PHONE, POS, POSAMT, INVBAL, CCBAL, INCOME 
+#LORES, HMVAL, AGE, and CRSCORE are continuous and
+#INV, CC, and CCPURC are categorical. The two groups will be imputed differently
+
+#Make imputation flag variables for continuous
+ins_training<-ins_training %>%
+  mutate(ACCTAGE_IMP=ifelse(is.na(ACCTAGE)==TRUE,1,0),
+         PHONE_IMP=ifelse(is.na(PHONE)==TRUE,1,0),
+         POS_IMP=ifelse(is.na(POS)==TRUE,1,0),
+         POSAMT_IMP=ifelse(is.na(POSAMT)==TRUE,1,0),
+         INVBAL_IMP=ifelse(is.na(INVBAL)==TRUE,1,0),
+         CCBAL_IMP=ifelse(is.na(CCBAL)==TRUE,1,0),
+         INCOME_IMP=ifelse(is.na(INCOME)==TRUE,1,0),
+         LORES_IMP=ifelse(is.na(LORES)==TRUE,1,0),
+         HMVAL_IMP=ifelse(is.na(HMVAL)==TRUE,1,0),
+         AGE_IMP=ifelse(is.na(AGE)==TRUE,1,0),
+         CRSCORE_IMP=ifelse(is.na(CRSCORE)==TRUE,1,0)
+  )
+
+#Impute continuous missing values with median
+ins_training<-ins_training %>%
+  mutate(ACCTAGE=ifelse(is.na(ACCTAGE)==TRUE,median(ACCTAGE,na.rm=TRUE),ACCTAGE),
+         PHONE=ifelse(is.na(PHONE)==TRUE,median(PHONE,na.rm=TRUE),PHONE),
+         POS=ifelse(is.na(POS)==TRUE,median(POS,na.rm=TRUE),POS),
+         POSAMT=ifelse(is.na(POSAMT)==TRUE,median(POSAMT,na.rm=TRUE),POSAMT),
+         INVBAL=ifelse(is.na(INVBAL)==TRUE,median(INVBAL,na.rm=TRUE),INVBAL),
+         CCBAL=ifelse(is.na(CCBAL)==TRUE,median(CCBAL,na.rm=TRUE),CCBAL),
+         INCOME=ifelse(is.na(INCOME)==TRUE,median(INCOME,na.rm=TRUE),INCOME),
+         LORES=ifelse(is.na(LORES)==TRUE,median(LORES,na.rm=TRUE),LORES),
+         HMVAL=ifelse(is.na(HMVAL)==TRUE,median(HMVAL,na.rm=TRUE),HMVAL),
+         AGE=ifelse(is.na(AGE)==TRUE,median(AGE,na.rm=TRUE),AGE),
+         CRSCORE=ifelse(is.na(CRSCORE)==TRUE,median(CRSCORE,na.rm=TRUE),CRSCORE)
+  )
+
+#Make various features factors
+ins_training<-ins_training %>%
+  mutate(DDA=factor(DDA),
+         DIRDEP=factor(DIRDEP),
+         NSF=factor(NSF),
+         SAV=factor(SAV),
+         ATM=factor(ATM),
+         CD=factor(CD),
+         IRA=factor(IRA),
+         INV=factor(INV),
+         MM=factor(MM),
+         MMCRED=factor(MMCRED),
+         CC=factor(CC),
+         CCPURC=factor(CCPURC),
+         SDB=factor(SDB),
+         INAREA=factor(INAREA),
+         INS=factor(INS),
+         BRANCH=factor(BRANCH),
+         ACCTAGE_IMP=factor(ACCTAGE_IMP),
+         PHONE_IMP=factor(PHONE_IMP),
+         POS_IMP=factor(POS_IMP),
+         POSAMT_IMP=factor(POSAMT_IMP),
+         INVBAL_IMP=factor(INVBAL_IMP),
+         CCBAL_IMP=factor(CCBAL_IMP),
+         INCOME_IMP=factor(INCOME_IMP),
+         LORES_IMP=factor(LORES_IMP),
+         HMVAL_IMP=factor(HMVAL_IMP),
+         AGE_IMP=factor(AGE_IMP),
+         CRSCORE_IMP=factor(CRSCORE_IMP)
+  )
+
+#For categorical variables 22, 27, and 29 make a missing value category
+levels(ins_training[[22]])<-c(levels(ins_training[[22]]), "Missing")
+ins_training[[22]][is.na(ins_training[[22]])]<-"Missing"
+
+levels(ins_training[[27]])<-c(levels(ins_training[[27]]), "Missing")
+ins_training[[27]][is.na(ins_training[[27]])]<-"Missing"
+
+levels(ins_training[[29]])<-c(levels(ins_training[[29]]), "Missing")
+ins_training[[29]][is.na(ins_training[[29]])]<-"Missing"
+################################################################################
+
+#########################Make EARTH (MARS copycat) model########################
+set.seed(19)
+EARTH_model<-earth(INS~.,data=ins_training,
+                   glm=list(family=binomial),
+                   nfold=10,trace=.5,pmethod="cv"
+)
+summary(EARTH_model)
+evimp(EARTH_model)
+#Variable importance: 15 variables were used in the model. In order of importance
+#SAVBAL, CDBAL, DDA1, DDABAL, MMBAL, INVMissing, ACCTAGE, CHECKS, TELLER,
+#ATMAMT, INV1, CC1, CCBAL, BRANCHB16, and IRABAL
+
+################################################################################
+
+#############Make GAM on training data##########################################
+
+#Select gam variables with regression splines...select = TRUE to zero out variables
+gam_select <- mgcv::gam(INS ~ s(ACCTAGE)+DDA+s(DDABAL)+s(DEP)+s(DEPAMT)+s(CHECKS)+DIRDEP+NSF+
+                          
+                          s(NSFAMT)+s(PHONE)+s(TELLER)+SAV+s(SAVBAL)+ATM+s(ATMAMT)+s(POS)+s(POSAMT)+
+                          
+                          CD+s(CDBAL)+IRA+s(IRABAL)+s(INVBAL)+MM+s(MMBAL)+MMCRED+s(CCBAL)+
+                          
+                          CCPURC+SDB+s(INCOME)+s(LORES)+s(HMVAL)+s(AGE)+s(CRSCORE)+INAREA+
+                          
+                          ACCTAGE_IMP+ 
+                          
+                          HMVAL_IMP+ AGE_IMP+ CRSCORE_IMP+
+                          
+                          INV+CC+BRANCH+CCBAL_IMP+
+                          
+                          PHONE_IMP+POS_IMP+POSAMT_IMP+INVBAL_IMP+INCOME_IMP+LORES_IMP
+                        #Drop the above variables due to multi-collinearity
+                        ,data = ins_training,
+                        
+                        family = binomial(link = "logit"), method = 'REML', select = FALSE)
+
+gam_p_values<-data.frame(summary(gam_select)[["p.table"]])
+################################################################################
+
+##################Make Random Forest model#####################################
+set.seed(19)
+rand_for_model<-randomForest(factor(INS)~.,data=ins_training,
+                             ntree=400,importance=TRUE)
+
+varImpPlot(rand_for_model,sort=TRUE,n.var=15,type=1,
+           main="Top 15 Variable Importance")
+
+rand_for_var_imp<-data.frame(importance(rand_for_model)) %>%
+  arrange(desc(MeanDecreaseAccuracy))
+write.csv(rand_for_var_imp,"rand_for_var_imp.csv")
+#Wrt MSE, random is near last;wrt gini decrease, random is 4th!
+################################################################################
+
+
+#####################################Build xgboost model########################
+train_X<-model.matrix(INS~.,data=ins_training)[,-37]
+train_y<-ins_training$INS
+
+#set.seed(19)
+#xgboost_model<-xgb.cv(data=train_X,label=train_y,subsample=.5,
+#                       nrounds=100,nfold=10,objective="binary:logistic",
+#                      metrics="auc")
+#Given log loss on testing data, set nrounds from 10 to 15 in grid search.
+
+#Grid search for better parameters
+tune_grid<-expand.grid(
+  nrounds=c(11:14),
+  eta=seq(.1,.3,.05),
+  max_depth=c(1:10),
+  gamma=c(0),
+  colsample_bytree=1,
+  min_child_weight=1,
+  subsample=seq(.25,1,.25)
+)
+
+# set.seed(19)
+# xgboost_model_tuner<-caret::train(x=train_X,y=train_y,
+#                            method="xgbTree",
+#                            metric="auc",
+#                            tuneGrid=tune_grid,
+#                            trControl = trainControl(method="cv",number=10),
+#                            objective="binary:logistic",
+#                            verbosity=0)
+
+#Looking at xgboost_model_tuner$bestTune, we can find the best tuning parameters!
+
+#Construct final model for XGBoost
+set.seed(19)
+xgboost_final_model<-xgboost(data = train_X, label = as.character(train_y), subsample = 1,
+                             nrounds = 15, eta = 0.3, max_depth = 5,
+                             colsample_bytree=.9,
+                             metrics= "auc", objective="binary:logistic")
+
+#Get variable importance
+xgboost_var_imp<-xgb.importance(feature_names = colnames(train_X), model = xgboost_final_model)
+write.csv(xgboost_var_imp,"xgboost_var_imp.csv")
+################################################################################
+
+
+#####################################Create Neural Network Model################
+#Create neural network model on training data with the use of a tuning grid.
+tune_grid_nn<-expand.grid(
+  .size=c(3,4,5,6,7,8,9,10),
+  .decay=c(0,.25,.5,.75,1)
+)
+
+set.seed(19)
+# nn_model_grid<-caret::train(INS~., data=ins_training, method="nnet",
+#                      tuneGrid=tune_grid_nn, trace=FALSE, linout=FALSE,
+#                      trControl=trainControl(method="cv", number=10)
+#                      )
+#Got size=9,decay=.5 for best model
+#Plot ROC curve for neural network
+
+set.seed(19)
+nn_final_model<-nnet(INS~., data=ins_training, 
+                     size=9 , decay=.5 ,
+                     lineout=FALSE)
+
+################################Get AUC on training data########################
+#EARTH (MARS copy-cat)
+ins_training$p_hat<-predict(EARTH_model,type="response")
+roc_curve_EARTH<-rocit(score=c(ins_training$p_hat),
+                       class=ins_training$INS)
+
+summary(roc_curve_EARTH)
+#AUC_EARTH=.7983
+plot(roc_curve_EARTH)
+
+#GAM
+ins_training[['p_hat_gam']] <- predict(gam_select, type = "response")
+gam_roc <- rocit(ins_training$p_hat_gam, ins_training$INS)
+
+summary(gam_roc) 
+# AUC_gam = .8034
+plot(gam_roc)
+
+#Random Forest
+ins_training[['p_hat_rand_for']] <- as.numeric(predict(rand_for_model, type = "prob")[,2])
+rand_for_roc <- rocit(score=array(ins_training$p_hat_rand_for),
+                      class=array(ins_training$INS))
+summary(rand_for_roc) 
+# AUC_rand_for = .7943
+plot(rand_for_roc)
+
+#XGBoost
+ins_training[['p_hat_xgboost']] <- as.numeric(predict(xgboost_final_model,
+                                                      train_X, type = "prob"))
+xgboost_roc <- rocit(score=array(ins_training$p_hat_xgboost),
+                     class=array(ins_training$INS))
+
+summary(xgboost_roc) 
+# AUC_xgboost = .8599
+plot(xgboost_roc)
+
+#Neural Network
+ins_training[['p_hat_nn']] <- as.numeric(predict(nn_final_model, type = "raw")[,1])
+nn_roc <- rocit(score=array(ins_training$p_hat_nn),
+                class=array(as.character(ins_training$INS)))
+summary(nn_roc) 
+# AUC_nn = .7509
+plot(nn_roc)
+################################################################################
+
+####################################Conclusion################################
+#XGBoost performed the best on a predictive level. Among the variables in the
+#dataset, the most important features are savings and checking account balances
+#along with an indicator for a money market account. These variables make sense
+#being important as having money (account balances) and having an interest in
+#investment (money market indication) would likely aid in prediction if one
+#wants an annuity product.
