@@ -1,0 +1,261 @@
+library(dplyr)
+library(stringr) #Used for word() function
+library(ggplot2) 
+library(ggfortify) #Need this to plot ts objects in autoplot()
+library(ggthemes) #Used for theme_calc() to make graphs pretty
+library(expsmooth) #Used for ets() function
+library(forecast) #Used for forecast(), auto.arima(), nsdiffs(), and nnetar() 
+library(aTSA) #Used for Dickey Fuller test adf.test()
+library(prophet) #Used for prophet() function
+
+#############################Prepare data for analysis##########################
+
+#get raw data and subset to features needed
+raw_data<-read.csv("C:/Users/sudra/OneDrive/Desktop/Time_Series_2_Files/Time Series 2 HW 1/hrl_load_metered.csv")
+raw_data<-rbind(raw_data,
+                read.csv("C:/Users/sudra/OneDrive/Desktop/Time_Series_2_Files/Time Series 2 HW 1/hrl_load_metered - test1.csv"),
+                read.csv("C:/Users/sudra/OneDrive/Desktop/Time_Series_2_Files/Time Series 2 HW 1/hrl_load_metered - test2.csv"),
+                read.csv("C:/Users/sudra/OneDrive/Desktop/Time_Series_2_Files/Time Series 2 HW 2/hrl_load_metered - test3.csv"),
+                read.csv("C:/Users/sudra/OneDrive/Desktop/Time_Series_2_Files/Time Series 2 HW 2/hrl_load_metered - test4.csv"),
+                read.csv("C:/Users/sudra/OneDrive/Desktop/Time_Series_2_Files/Time Series 2 HW 2/hrl_load_metered - test5.csv")
+                
+)
+
+
+
+#select features needed for analysis
+hourly_elec_df<-raw_data %>%
+  select(datetime_beginning_ept,mw)
+
+#create a time series and plot it
+hourly_elec_ts<-ts(hourly_elec_df$mw, start=2016,frequency=24*365)
+
+#autoplot(hourly_elec_ts)
+
+#There appears to be low spikes that look odd
+outliers<-hourly_elec_df %>%
+  filter(mw<2500)
+#The spike(s) from 2018 seems fine as the low value is sustained over time.
+#However, the spike from 2019 looks like a transcription error!
+
+
+#Fix error from 2019 by getting adjacent mw values, taking the average, and 
+#updating the erroneous value to the calculated average.
+
+#Find surrounding mw values from the erroneous value
+temp<-hourly_elec_df %>%
+  filter(datetime_beginning_ept %in% c("6/8/19 1:00","6/8/19 2:00","6/8/19 3:00"))
+
+#Replace erroneous value with the mean as stated above
+mask=hourly_elec_df$mw==1289.923
+hourly_elec_df<-hourly_elec_df%>%
+  mutate(mw=ifelse(mask,mean(3386.069,3230.526),mw))
+
+#Look at errors on Nov. 14 2018
+plot(hourly_elec_df$mw[25130:25200])
+
+#Fix errors from Nov. 14 2018 by adding a fixed value
+hourly_elec_df$mw[25153:25176]<-hourly_elec_df$mw[25153:25176]+2500
+
+#Create training and validation sets of data
+hourly_elec_ts<-ts(
+  head(hourly_elec_df$mw,length(hourly_elec_df$mw)-24*7)
+  ,start=2016,frequency=24)
+validation_data<-tail(hourly_elec_df$mw,24*7)
+validation_ts<-ts(validation_data,start=2023,frequency=24)
+
+#Autoplot looks good now. I also looked at high spikes and they seem fine.
+
+#autoplot(hourly_elec_ts)
+################################################################################
+
+################################Create Exp. Smoothing Model#####################
+
+#Use a Holt-Winters Model
+hw_model<-forecast::hw(hourly_elec_ts,h=24*7,seasonal="multiplicative")
+summary(hw_model)
+
+#Get MAPE and MAE on validataion data
+abs_diff_hw<-abs(validation_data-hw_model$mean)
+MAE_hw<-mean(abs_diff_hw)
+MAPE_hw<-100*mean((abs_diff_hw/abs(validation_data)))
+#MAE is 242.28 and MAPE is 6.06%.
+
+#Plot hw forecast against validation data
+ggplot(data = validation_data-hw_model$mean, aes(x = time(validation_ts))) +
+  geom_line(aes(y = validation_data, color = "Actual Values")) +
+  geom_line(aes(y = hw_model$mean, color = "Forecasted Values (Holt-Winters)")) +
+  xlab("Time (in hours)") +
+  ylab("Electric Usage (in Megawatts)") +
+  ggtitle("Hourly Electricity Use: Forecasted vs Actual Values") +
+  theme_calc() + 
+  scale_color_calc() +
+  scale_color_manual(
+    name = "Plots",
+    values = c("Actual Values" = "red", "Forecasted Values (Holt-Winters)" = "blue"),
+    breaks = c("Actual Values", "Forecasted Values")
+  )+
+  scale_x_continuous(
+    breaks = seq(2023, 2030, by = 1),  
+    labels = c("10/18", "10/19", "10/20", "10/21", "10/22", "10/23", "10/24", "10/25")
+  )
+################################################################################
+
+
+########################Create Seasonal ARIMA Model#############################
+
+
+#Perform a Canova-Hansen test to see if seasonal differences are needed
+nsdiffs(hourly_elec_ts,test="ch")
+#Output is 1 so we should take one seasonal difference. This suggests that
+#We should employ a seasonal ARIMA. Looking at the data, differencing by 24
+#Would be ideal.
+
+#Perform a Dickey-Fuller test on a seasonal difference of length 24 to see
+#if a first order difference is needed on the seasonally differenced data
+ndiffs(diff(hourly_elec_ts,lag=24))
+#Output is zero so no additional differences needed. Series is now stationary.
+#autoplot(diff(hourly_elec_ts,lag=24))
+#looks stationary to me!
+
+#Find seasonal arima terms
+ARIMA<-Arima(hourly_elec_ts,order=c(2,0,0),season=c(1,1,1),method="CSS")
+summary(ARIMA)
+
+#Perform Ljung-Box test on residuals to see if they are white noise or not.
+checkresiduals(ARIMA)
+#p-value is less than 2.2e^-16, so we DON'T have white noise. This suggests
+#that other methods would be better. However, I will compare this seasonal
+#ARIMA to the validation dataset anyway for completion's sake.
+
+#Test on validation data.
+ARIMA_forecast<-forecast::forecast(ARIMA,h=24*7)
+abs_diff_ARIMA<-abs(validation_data-ARIMA_forecast$mean)
+MAE_ARIMA<-mean(abs_diff_ARIMA)
+MAPE_ARIMA<-100*mean((abs_diff_ARIMA/abs(validation_data)))
+
+#MAE is 199.89, and MAPE is 5.14%.
+
+#Plot hw forecast against validation data
+ggplot(data = validation_data-hw_model$mean, aes(x = time(validation_ts))) +
+  geom_line(aes(y = validation_data, color = "Actual Values")) +
+  geom_line(aes(y = hw_model$mean, color = "Forecasted Values (Holt-Winters)")) +
+  geom_line(aes(y = ARIMA_forecast$mean,color= "Forecasted Values (Seasonal ARIMA)"))+
+  xlab("Time (in hours)") +
+  ylab("Electric Usage (in Megawatts)") +
+  ggtitle("Hourly Electricity Use: Forecasted vs Actual Values") +
+  theme_calc() + 
+  scale_color_calc() +
+  scale_color_manual(
+    name = "Plots",
+    values = c("Actual Values" = "black", "Forecasted Values (Holt-Winters)" = "blue", "Forecasted Values (Seasonal ARIMA)"="orange"),
+    breaks = c("Actual Values", "Forecasted Values (Holt-Winters)","Forecasted Values (Seasonal ARIMA)")
+  )+
+  scale_x_continuous(
+    breaks = seq(2023, 2030, by = 1),  
+    labels = c("10/18", "10/19", "10/20", "10/21", "10/22", "10/23", "10/24", "10/25")
+  )
+################################################################################
+
+
+###################################Create Prophet Model#########################
+#build data frame for predictions
+prophet_data<-data.frame(ds=seq(as.POSIXct("2016-01-01 0:00"),as.POSIXct("2023-10-18 23:00"),by="hour"),
+                         y=hourly_elec_ts)
+
+#initalize prophet model
+prophet_model<-prophet()
+
+#add default US holidays
+prophet_model<-add_country_holidays(prophet_model,"US")
+
+#Add daily seasonality component
+prophet_model<-add_seasonality(prophet_model,name="d",period=24,
+                               fourier.order = 6)
+#Fit model to data
+prophet_model<-fit.prophet(prophet_model,prophet_data)
+
+#Make prediction on validation data
+prophet_forecast_data<-make_future_dataframe(prophet_model,periods=168,freq=3600)
+
+#Get MAPE and MAE on validation data
+prophet_validation_forecast<-tail(predict(prophet_model,prophet_forecast_data)$yhat,168)
+prophet_MAE<-mean(abs(validation_data-prophet_validation_forecast))
+prophet_MAPE<-100*mean((abs(validation_data-prophet_validation_forecast))/abs(validation_data))
+
+#MAE is 267.71 and MAPE is 6.92%
+################################################################################
+
+#########################Create Neural Network Model###########################
+
+#Recall that the seasonal ARIMA was (2,0,0)(1,1,1)[24]. As such, we will use
+#p=2 and P=1 in our neural network model!
+
+#set seed
+set.seed(42)
+
+#Make neural network model
+nn_model<-nnetar(diff(hourly_elec_df$mw,24),p=2,P=1)
+
+#Forecast is on differenced data! we need to integrate it back.
+nn_validation_forecast_diff<-forecast::forecast(nn_model,h=168)
+
+#Initialize nn_validation_forecast
+nn_validation_forecast<-numeric(168)
+
+# Build the first day of the forecast 
+for (i in 1:24){
+  nn_validation_forecast[i] <- hourly_elec_ts[length(hourly_elec_ts)-24+i]+
+    nn_validation_forecast_diff$mean[i]
+}
+
+#build the rest of the days
+for (j in 1:6){
+  for (i in 1:24){
+    nn_validation_forecast[i+24*j]<-nn_validation_forecast[i+24*(j-1)]+
+      nn_validation_forecast_diff$mean[i+24*j]
+  }
+}
+
+#Test neural network model on validation data.
+nn_MAE<-mean(abs(validation_data-nn_validation_forecast))
+nn_MAPE<-100*mean((abs(validation_data-nn_validation_forecast))/abs(validation_data))
+
+#For p=2, P=1, MAE=209.55 and MAPE=5.39%
+
+
+# Convert time series objects to data frames
+validation_df <- data.frame(time = time(validation_ts), actual = validation_data)
+forecast_df_prophet <- data.frame(time = time(validation_ts), forecast = prophet_validation_forecast)
+forecast_nn_df<- data.frame(time=time(validation_ts),forecast=nn_validation_forecast)
+
+# Plot Prophet forecast against validation data
+ggplot() +
+  geom_line(data = validation_df, aes(x = time, y = actual, color = "Actual Values"), size=1) +
+  geom_line(data = forecast_df_prophet, aes(x = time, y = forecast, color = "Forecasted Values (Prophet)"), size=1) +
+  geom_line(data=forecast_nn_df, aes(x=time, y=forecast, color= "Forecasted Values (Neural Network)"), size=1)+
+  xlab("Time (in hours)") +
+  ylab("Electric Usage (in Megawatts)") +
+  #ggtitle("Hourly Electricity Use: Forecasted vs Actual Values") +
+  theme_calc() + 
+  scale_color_calc() +
+  scale_color_manual(
+    name = "Plots",
+    values = c("Actual Values" = "black", "Forecasted Values (Prophet)" = "dodgerblue", "Forecasted Values (Neural Network)"="orange"),
+    breaks = c("Actual Values", "Forecasted Values (Prophet)","Forecasted Values (Neural Network)")
+  ) +
+  scale_x_continuous(
+    breaks = seq(2023, 2030, by = 1),  
+    labels = c("10/18", "10/19", "10/20", "10/21", "10/22", "10/23", "10/24", "10/25")
+  )
+################################################################################
+
+
+##############################Create Ensemble Model#############################
+#Get ensemble validation scores. Note: Ensemble model is of ARIMA, Prophet, and Neural Network models
+ensemble_MAE<-mean(abs(validation_data-.333*(ARIMA_forecast$mean+nn_validation_forecast+prophet_validation_forecast)))
+ensemble_MAPE<-100*mean((abs(validation_data-.333*(nn_validation_forecast+ARIMA_forecast$mean+prophet_validation_forecast)))/abs(validation_data))
+
+#Ensemble MAE is 187.06 MW and Ensemble MAPE is 4.76%.
+
+#As expected, the ensemble model has the lowest MAE and MAPE in predicting MW.
